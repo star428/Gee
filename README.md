@@ -158,3 +158,92 @@ curl "http://localhost:9999/hello?name=geektutu" // GET
 curl "http://localhost:9999/login" -X POST -d 'username=geektutu&password=1234' // POST
 结果是以json格式返回POST Body中的信息
 ```
+
+## day3-前缀树路由Router
+
+* 使用Trie树（前缀树）实现动态路由解析
+* 支持两种模式匹配（动态匹配），`:name`和 `*filepath`
+
+### Trie树
+
+之前我们实现router是这么实现的：
+
+`./day2-context/gee/router.go`
+
+```go
+type router struct {
+	// key: method + pattern
+	handlers map[string]HandlerFunc
+}
+```
+
+这种方式只可以存储静态路由，对于动态路由（一条路由规则匹配多种路由），比如：`/hello/:name`，可以匹配 `/hello/geektutu`,`/hello/jack`等。
+
+我们使用前缀树来作为动态路由匹配的底层数据结构，url请求路径是由 /来分隔的，那么每一段都可以当作前缀树的节点，查询树（GET树和POST树）即可获得目前输入的url是否匹配某一段路由。
+
+实现的动态路由具备下面两个功能：
+
+* 参数匹配 `:`。例如 `/p/:lang/doc`，匹配 `/p/c/doc`和 `/p/go/doc`
+* 通配符 `*`。例如 `/static/*filePath`，可以匹配 `/static/fav.ico`，也可以匹配 `/static/js/jQuery.js`。
+
+### Trie树实现
+
+首先定义每个node的数据结构：
+
+```go
+type node struct {
+	pattern  string // 待匹配路由，例如 /p/:lang
+	part     string // 路由中的一部分，例如 :lang
+	children []*node // 子节点，例如 [doc, tutorial, intro]
+	isWild   bool // 是否精确匹配，part 含有 : 或 * 时为true
+}
+```
+
+可以看到在最终的节点上pattern才有值，若是匹配结束后的层高上没有相关的pattern匹配字段，说明匹配失败。
+
+`iswild`代表这一层可以随意匹配，不管这一层上究竟上面的值是多少
+
+路由实现了两个功能，就是注册与匹配。
+
+* **注册**：开发服务时，注册路由规则映射handler。
+
+* **访问**：匹配路由规则，查找到相关的handler。
+
+所以Trie树要实现节点的插入与查询。
+
+* **插入：**递归查找每一层的节点，如果没有匹配到当前part的节点，就新建一个同时加入children list中
+* **查询：**退出规则为层高为parts的高度或者匹配到了*，则查询当前node的pattern是否为 `""`（**只有在插入的最后一个node才放匹配的pattern，中间节点是没有的**），然后输出相关的node（内含pattern匹配规则用来后面匹配处理的func）
+
+### Router
+
+实现注册与访问函数：
+
+```go
+type router struct {
+	roots    map[string]*node
+	handlers map[string]HandlerFunc
+}
+// roots key eg, roots['GET'] roots['POST']
+// handlers key eg, handlers['GET-/p/:lang/doc'], handlers['POST-/p/book']
+```
+
+其中访问函数 `getRoute`中，解析了 `:`和 `*`两种匹配符的参数，返回一个map， 例如 `/p/go/doc`匹配到 `/p/:lang/doc`，解析结果为：`{lang: "go"}`，`/static/css/geektutu.css`匹配到 `/static/*filepath`，解析结果为 `{filepath: "css/geektutu.css"}`。
+
+### Context和handle（router.go）的变化
+
+context中增加对url解析出来 `:`和 `*`的内容方便后面做处理
+
+handle中getRoute得到相关的node后，再根据handlers中的func进行接下来的处理和操作
+
+```go
+func (r *router) handle(c *Context) {
+	n, params := r.getRoute(c.Method, c.Path)
+	if n != nil {
+		c.Params = params
+		key := c.Method + "-" + n.pattern
+		r.handlers[key](c)
+	} else {
+		c.String(http.StatusNotFound, "404 NOT FOUND: %s\n", c.Path)
+	}
+}
+```
