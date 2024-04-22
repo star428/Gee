@@ -206,7 +206,6 @@ type node struct {
 路由实现了两个功能，就是注册与匹配。
 
 * **注册**：开发服务时，注册路由规则映射handler。
-
 * **访问**：匹配路由规则，查找到相关的handler。
 
 所以Trie树要实现节点的插入与查询。
@@ -245,5 +244,190 @@ func (r *router) handle(c *Context) {
 	} else {
 		c.String(http.StatusNotFound, "404 NOT FOUND: %s\n", c.Path)
 	}
+}
+```
+
+## Day4-分组控制Group
+
+### 分组的意义
+
+分组指的是路由的分组，没有路由分组，我们需要对每一个路由进行控制（也就是写的每一个GET,POST等）。一般分组控制使用前缀来进行区分，比如 `/POST`是一个分组，那么 `/POST/A`和 `/POST/B`是该分组下的子分组，作用于 `/POST`分组上的中间件（middleware），也会作用于子分组，子分组也可以有自己特有的中间件。
+
+### 分组嵌套
+
+一个Group对象应该具有这些属性：
+
+1. 前缀（prefix）：比如 `/`，或者 `/api`
+2. 父亲（parent）：支持分组嵌套需要知道父亲节点是谁
+3. 该分组所含的中间件（middleware）：中间件应用在分组上
+4. 访问router的能力
+
+之前我们调用函数 `(*Engine).addRoute()`来映射路由规则和handler
+
+```go
+// addRoute adds a route to the router
+func (e *Engine) addRoute(method, pattern string, handler HandlerFunc) {
+	e.router.addRoute(method, pattern, handler)
+}
+```
+
+所以我们需要赋予每个组有访问router的能力（以前都是交给engine来管理），所以可以给每个group设置一个指向engine的指针，这样就可以使用engine的全部其他方法
+
+```go
+RouterGroup struct {
+	prefix      string
+	middlewares []HandlerFunc // support middleware
+	parent      *RouterGroup  // support nesting
+	engine      *Engine       // all groups share a Engine instance
+}
+```
+
+还可以进一步抽象，最初的engine也算一个group，就是最顶级的分组
+
+```go
+Engine struct {
+	*RouterGroup
+	router *router
+	groups []*RouterGroup // store all groups
+}
+```
+
+接下来将路由有关的函数都交给 `RouterGroup`来实现而不是 `engine`来实现即可
+
+包括三个函数：
+
+* addRoute
+* GET
+* POST
+
+全部由Engine转交到RouterGroup来实现
+
+```go
+func (group *RouterGroup) addRoute(method string, comp string, handler HandlerFunc) {
+	pattern := group.prefix + comp
+	log.Printf("Route %4s - %s", method, pattern)
+	group.engine.router.addRoute(method, pattern, handler)
+}
+```
+
+因为engine嵌套了 `*RouterGroup`，所以可以使用它的全部方法，使用的时候意味着编译器会生成新的方法，也就是接收者从 `*RouterGroup`变成 `*Engine`（参考gopl）
+
+## Day5-中间件middleware
+
+中间件（middleware）就是非业务的技术类组件。
+
+web框架不可能去理解所有的业务，我们需要一个接口来允许用户去**自定义功能**，嵌入到框架中。
+
+中间件需要考虑两个重要的点：
+
+* 插入点：不可以太接近框架底层，否则逻辑会变得复杂；如果插入点离用户过近，用户直接定义一组函数在相关的handler中调用这个函数即可就没必要使用中间件。
+* 中间件的输入：（我们会使用Context上下文作为输入），如果输入暴露的参数过少，用户发挥空间比较有限。
+
+### 中间件设计
+
+* 中间件的定义与路由映射的Handler（也就是HandlerFunc）一致，处理的输入是**Context**对象
+* 中间件的插入点是框架接收到request请求后（也就是[`(gee.Engine).ServeHTTP`](vscode-file://vscode-app/c:/Users/Administrator/AppData/Local/Programs/Microsoft%20VS%20Code/resources/app/out/vs/code/electron-sandbox/workbench/workbench.html "https://pkg.go.dev/Gee/day5-middleware/gee#Engine.ServeHTTP")），允许用户使用自己的中间件做一些额外的处理，比如记录日志等，以及对 `Context`进行二次加工。
+* 另外调用 `(gee.Context).Next`函数，中间件的执行可以分为两个部分：response之前和response之后处理
+* 同时支持多个中间件，依次进行调用。
+
+中间件应用于 `RouterGroup`之上，不作用于每一个路由规则上的原因，是基于每一条路由做中间件还不如直接在Handler中调用某个函数来的直观，通用性太差，不适合定义为中间件。
+
+我们之前的框架逻辑为：接收到请求后，匹配路由，该request的所有信息都会保存在 `Context`之中。所以我们需要接收到请求后，查找所有应用于该路由的中间件，保存在 `Context`之中，然后依次调用。
+
+此时我们给 `Context`添加了2个参数，定义了 `Next`方法。
+
+```go
+type Context struct {
+	// origin objects
+	Writer http.ResponseWriter
+	Req    *http.Request
+	// request info
+	Path   string
+	Method string
+	Params map[string]string
+	// response info
+	StatusCode int
+	// middleware
+	handlers []HandlerFunc
+	index    int
+}
+
+func newContext(w http.ResponseWriter, req *http.Request) *Context {
+	return &Context{
+		Path:   req.URL.Path,
+		Method: req.Method,
+		Req:    req,
+		Writer: w,
+		index:  -1,
+	}
+}
+
+func (c *Context) Next() {
+	c.index++
+	s := len(c.handlers)
+	for ; c.index < s; c.index++ {
+		c.handlers[c.index](c)
+	}
+}
+```
+
+注意handlers和index字段，第一个存储middleware和handlerFunc，第二个代表执行到哪个middleware/HandlerFunc，Next的用法如下所示：
+
+```go
+func A(c *Context) {
+    part1
+    c.Next()
+    part2
+}
+func B(c *Context) {
+    part3
+    c.Next()
+    part4
+}
+```
+
+此时我们应用了middleware A,B,和路由映射的handlerFunc，`c.handlers`里面的内容为 `[A, B, handler]`，此时调用的顺序为 `part1 -> part3 -> handler -> part2 -> part4`
+
+### 代码实现
+
+* 定义use函数，将中间件应用到某个Group。
+
+**gee.go**
+
+```go
+func (group *RouterGroup) Use(middlewares ...HandlerFunc) {
+	group.middlewares = append(group.middlewares, middlewares...)
+}
+
+func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	var middlewares []HandlerFunc
+	for _, group := range engine.groups {
+		if strings.HasPrefix(req.URL.Path, group.prefix) {
+			middlewares = append(middlewares, group.middlewares...)
+		}
+	}
+	c := newContext(w, req)
+	c.handlers = middlewares
+	engine.router.handle(c)
+```
+
+`engine.groups`记录了多少个组（根组也包含在内），然后通过判断组的前缀来判定（根组的前缀为""空字符串，所以都可以匹配）
+
+* handle函数中，将路由匹配得到的Handler添加到 `c.handlers`列表中，执行 `c.Next()`（index初始值为-1，也就是从这块开始执行第一个index=0的项）
+
+```go
+func (r *router) handle(c *Context) {
+	n, params := r.getRoute(c.Method, c.Path)
+
+	if n != nil {
+		key := c.Method + "-" + n.pattern
+		c.Params = params
+		c.handlers = append(c.handlers, r.handlers[key])
+	} else {
+		c.handlers = append(c.handlers, func(c *Context) {
+			c.String(http.StatusNotFound, "404 NOT FOUND: %s\n", c.Path)
+		})
+	}
+	c.Next()
 }
 ```
