@@ -431,3 +431,95 @@ func (r *router) handle(c *Context) {
 	c.Next()
 }
 ```
+
+## day6-HTML Template
+
+### 服务端渲染
+
+目前其实大多都是前后端分离，后端不传静态HTML页面（也就是渲染好的页面），而是提供RESTful接口，返回结构化的数据（JSON/XML）。
+
+但是前后端分离的话，页面是在客户端渲染，比如浏览器，对爬虫不友好（爬不到页面数据）。所以短期内爬取服务端直接渲染好的HTML页面也很重要。
+
+### 静态文件
+
+网页三大支持JS,CSS,HTML，服务器渲染要支持JS,CSS等静态文件。
+
+我们使用通配符 `*`来匹配多级子路径。比如路由规则 `/assets/*filepath`，我们可以匹配到 `/assets/js/geektutu.js`，然后可以获取filepath参数，为 `js/geektutu.js`。
+
+获取了filepath后，可以得到相对地址，组合为绝对地址后访问服务器上的相关资源（假设放在 `/usr/web`下，我们的filepath就是在这个地址上的相对地址）
+
+我们所做的工作就是解析请求的地址，映射到服务器上的真实地址，交给 `http.FileServer`即可
+
+```go
+// create static handler
+func (group *RouterGroup) createStaticHandler(relativePath string, fs http.FileSystem) HandlerFunc {
+	absolutePath := path.Join(group.prefix, relativePath)
+	fileServer := http.StripPrefix(absolutePath, http.FileServer(fs))
+	return func(c *Context) {
+		file := c.Param("filepath")
+		// Check if file exists and/or if we have permission to access it
+		if _, err := fs.Open(file); err != nil {
+			c.Status(http.StatusNotFound)
+			return
+		}
+		// 作为fileServer来处理来的HTTP请求，fileServer是一个interface里面只有一个ServeHTTP 			func
+		fileServer.ServeHTTP(c.Writer, c.Req)
+	}
+}
+
+// serve static files
+func (group *RouterGroup) Static(relativePath string, root string) {
+	handler := group.createStaticHandler(relativePath, http.Dir(root))
+	urlPattern := path.Join(relativePath, "/*filepath")
+	// Register GET handlers
+	group.GET(urlPattern, handler)
+}
+```
+
+### HTML模板渲染
+
+使用 `html/template`库，主要语句有两个：
+
+```go
+func (engine *Engine) LoadHTMLGlob(pattern string) {
+	engine.htmlTemplates = template.Must(template.New("").Funcs(engine.funcMap).ParseGlob(pattern))
+}
+
+
+func (c *Context) HTML(code int, name string, data interface{}) {
+	c.SetHeader("Content-Type", "text/html")
+	c.Status(code)
+	if err := c.engine.htmlTemplates.ExecuteTemplate(c.Writer, name, data); err != nil {
+		c.Fail(500, err.Error())
+	}
+}
+```
+
+第一个是将目前所有的pattern下(比如 `./templates/*`)都加载进内存
+
+第二个是根据模板name来选择哪一个模板执行渲染写入 `c.Writer`
+
+最终使用代码如下：
+
+```go
+r.GET("/", func(c *gee.Context) {
+		c.HTML(http.StatusOK, "css.tmpl", nil)
+	})
+	r.GET("/students", func(c *gee.Context) {
+		c.HTML(http.StatusOK, "arr.tmpl", gee.H{
+			"title":  "gee",
+			"stuArr": [2]*student{stu1, stu2},
+		})
+	})
+
+	r.GET("/date", func(c *gee.Context) {
+		c.HTML(http.StatusOK, "custom_func.tmpl", gee.H{
+			"title": "gee",
+			"now":   time.Now(),
+		})
+	})
+```
+
+* 第一个是测试css是否成功加载
+* 第二个是实验模板的data是否写入
+* 第三个同样也是实验data是否写入
