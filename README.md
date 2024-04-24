@@ -523,3 +523,27 @@ r.GET("/", func(c *gee.Context) {
 * 第一个是测试css是否成功加载
 * 第二个是实验模板的data是否写入
 * 第三个同样也是实验data是否写入
+
+## day7-错误恢复panic recover
+
+整体思路为创建一个错误处理中间件(middleware)，错误发生时返回给用户 `Internal Server error`：500，同时在服务端日志中打印必要的错误信息，方便进行错误定位。
+
+```go
+func Recovery() HandlerFunc {
+	return func(c *Context) {
+		defer func() {
+			if err := recover(); err != nil {
+				message := fmt.Sprintf("%s", err)
+				log.Printf("%s\n\n", trace(message))
+				c.Fail(500, "Internal Server Error") // 阻断器阻止后面的中间件执行
+			}
+		}()
+		c.Next()
+	}
+}
+
+```
+
+可以看到这个中间件只有在错误出现的时候会调用defer来进行最后的处理，同时还会调用 `c.Fail`来阻断后续中间件的执行（但是理论上都会执行结束，因为会在最后用户的HandlerFunc上出错，前面所有的中间件都可以顺利执行）
+
+其中 `trace()`函数可以获取堆栈信息，打印出错误信息
